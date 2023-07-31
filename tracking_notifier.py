@@ -9,12 +9,12 @@ from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
 import datetime
 from dateutil import tz
-from psycopg2 import extras, connect
+from psycopg2 import extras, connect, Error
 
 # Get Pacific timezone object
 tz_us_pacific = tz.gettz('US/Pacific')
 
-now = datetime.now(tz_us_pacific)
+now = datetime.datetime.now(tz_us_pacific)
 
 # Determine whether it's morning or afternoon
 if now.hour < 12:
@@ -68,11 +68,29 @@ def lambda_handler(event, context):
 
         # If we received database entries, add them to the database
         if "database_entries" in event_body:
+            print("Received database entries list")
+            database_entries = event_body['database_entries']
+
+            if not database_entries:
+                print(f"Database entries list empty; ending execution")
+                return
+
+            num_new_entries = len(database_entries)
+
+            print(f"Adding {len(num_new_entries)} shipments from new shipment batch to database")
+            print(f"Full batch for reference: {database_entries}")
             # Iterate over the entries
-            for entry in event_body['database_entries']:
+
+            counter = 0
+            for entry in database_entries:
+                counter += 1
+                print(f"Processing order {counter} of {num_new_entries}")
                 # Prepare the SQL statement
-                sql = '''INSERT INTO "shipments" ("OrderNumber", "CustomerName", "CustomerEmail", "TrackingNumber", "CarrierName", "ShippedDate", "StatusCode", "LastLocation", "DaysAtLastLocation", "NotificationSent", "Delayed", "Delivered")
-                          VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);'''
+                sql = '''
+                    INSERT INTO "shipments" ("OrderNumber", "CustomerName", "CustomerEmail", "TrackingNumber", "CarrierName", "ShippedDate", "StatusCode", "LastLocation", "DaysAtLastLocation", "NotificationSent", "Delayed", "Delivered")
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT ("TrackingNumber") DO NOTHING;
+                '''
 
                 # Create a tuple with all the values to insert
                 data = (entry['OrderNumber'], entry['CustomerName'], entry['CustomerEmail'], entry['TrackingNumber'], entry['CarrierName'], entry['ShippedDate'], entry['StatusCode'], entry['LastLocation'], entry['DaysAtLastLocation'], entry['NotificationSent'], entry['Delayed'], entry['Delivered'])
@@ -107,7 +125,6 @@ def lambda_handler(event, context):
     for row in cursor.fetchall():
         processed_shipments += 1
         print(f"Processing shipment {processed_shipments} out of {total_shipments}")
-        
         try:
             print(list(row.keys()))
             tracking_number = row['TrackingNumber']
@@ -139,21 +156,23 @@ def lambda_handler(event, context):
                 or 'activity' not in details['trackResponse']['shipment'][0]['package'][0]):
                     print(f"Tracking details not found for {tracking_number}.")
                     continue
-
             package_details = details['trackResponse']['shipment'][0]['package'][0]
             activity = package_details['activity'][0]
             status_code = package_details['currentStatus']['code']
             status_code_desc = package_details['currentStatus']['description']
             new_status_entry = f"{status_code}: {status_code_desc}"
-
             is_delivered = status_code in config.delivered_codes
             is_problem_code = status_code in config.problem_codes_ups
             is_delayed = status_code in config.delay_codes
             is_stuck = False
 
             # Update the StatusCode in the database
-            update_query = "UPDATE shipments SET \"StatusCode\"=%s WHERE \"OrderNumber\"=%s;"
-            cursor.execute(update_query, (new_status_entry, row['OrderNumber']))
+            try:
+                update_query = "UPDATE shipments SET \"StatusCode\"=%s WHERE \"OrderNumber\"=%s;"
+                cursor.execute(update_query, (new_status_entry, row['OrderNumber']))
+            except (Error, psycopg2.ProgrammingError, psycopg2.OperationalError) as e:
+                print(f"Database error occurred while updating status code: {e}")
+                continue
 
             current_date = datetime.datetime.now(tz_us_pacific).strftime("%Y%m%d")
 
@@ -163,39 +182,57 @@ def lambda_handler(event, context):
 
             try:
                 current_location = activity['location']['address']['city']
-                
                 # Fetch the previous location and the date it was updated
-                fetch_location_query = "SELECT \"LastLocation\", \"LastLocationDate\" FROM shipments WHERE \"OrderNumber\"=%s;"
-                cursor.execute(fetch_location_query, (row['OrderNumber'],))
-                result = cursor.fetchone()
+                try:
+                    fetch_location_query = "SELECT \"LastLocation\", \"LastLocationDate\" FROM shipments WHERE \"OrderNumber\"=%s;"
+                    cursor.execute(fetch_location_query, (row['OrderNumber'],))
+                    result = cursor.fetchone()
+                except (Error, psycopg2.ProgrammingError, psycopg2.OperationalError) as e:
+                    print(f"Database error occurred while fetching location: {e}")
+                    continue
 
                 # Check if a row was returned from the database
                 if result is not None:
                     previous_location, previous_location_date = result
-                    
                     # Check if LastLocation exists
                     if previous_location:
                         if current_location != previous_location:
                             # Update LastLocation, set LastLocationDate to current date and DaysAtLastLocation to 0
-                            update_query = "UPDATE shipments SET \"LastLocation\"=%s, \"LastLocationDate\"=%s, \"DaysAtLastLocation\"=0 WHERE \"OrderNumber\"=%s;"
-                            cursor.execute(update_query, (current_location, current_date, row['OrderNumber']))
+                            try:
+                                update_query = "UPDATE shipments SET \"LastLocation\"=%s, \"LastLocationDate\"=%s, \"DaysAtLastLocation\"=0 WHERE \"OrderNumber\"=%s;"
+                                cursor.execute(update_query, (current_location, current_date, row['OrderNumber']))
+                            except (Error, psycopg2.ProgrammingError, psycopg2.OperationalError) as e:
+                                print(f"Database error occurred while updating last location: {e}")
+                                continue
                         else:
                             # Calculate days at current location
                             if previous_location_date is not None:
                                 days_at_location = calculate_days(previous_location_date, current_date)
-                                update_query = "UPDATE shipments SET \"DaysAtLastLocation\"=%s WHERE \"OrderNumber\"=%s;"
-                                cursor.execute(update_query, (days_at_location, row['OrderNumber']))
+                                try:
+                                    update_query = "UPDATE shipments SET \"DaysAtLastLocation\"=%s WHERE \"OrderNumber\"=%s;"
+                                    cursor.execute(update_query, (days_at_location, row['OrderNumber']))
+                                except (Error, psycopg2.ProgrammingError, psycopg2.OperationalError) as e:
+                                    print(f"Database error occurred while updating days at last location: {e}")
+                                    continue
                                 if days_at_location >= 3:
                                     is_problem_code = True
                                     is_stuck = True
                             else:
                                 # If LastLocationDate is None, set it to the current date and DaysAtLastLocation to 0
-                                update_query = "UPDATE shipments SET \"LastLocationDate\"=%s, \"DaysAtLastLocation\"=0 WHERE \"OrderNumber\"=%s;"
-                                cursor.execute(update_query, (current_date, row['OrderNumber']))
+                                try:
+                                    update_query = "UPDATE shipments SET \"LastLocationDate\"=%s, \"DaysAtLastLocation\"=0 WHERE \"OrderNumber\"=%s;"
+                                    cursor.execute(update_query, (current_date, row['OrderNumber']))
+                                except (Error, psycopg2.ProgrammingError, psycopg2.OperationalError) as e:
+                                    print(f"Database error occurred while updating last location date: {e}")
+                                    continue
                     else:
                         # If LastLocation is None, set it to the current location, LastLocationDate to current date and DaysAtLastLocation to 0
-                        update_query = "UPDATE shipments SET \"LastLocation\"=%s, \"LastLocationDate\"=%s, \"DaysAtLastLocation\"=0 WHERE \"OrderNumber\"=%s;"
-                        cursor.execute(update_query, (current_location, current_date, row['OrderNumber']))
+                        try:
+                            update_query = "UPDATE shipments SET \"LastLocation\"=%s, \"LastLocationDate\"=%s, \"DaysAtLastLocation\"=0 WHERE \"OrderNumber\"=%s;"
+                            cursor.execute(update_query, (current_location, current_date, row['OrderNumber']))
+                        except (Error, psycopg2.ProgrammingError, psycopg2.OperationalError) as e:
+                            print(f"Database error occurred while updating last location: {e}")
+                            continue
                 else:
                     print(f"No record found for order: {row['OrderNumber']}")
                     continue
@@ -203,74 +240,94 @@ def lambda_handler(event, context):
                 print(f"Error processing order {row['OrderNumber']}: {e}")
 
             if is_delivered:
-                delivered_query = "UPDATE shipments SET \"Delivered\"='Yes' WHERE \"OrderNumber\"=%s;"
-                cursor.execute(delivered_query, (row['OrderNumber'],))
-                # Move to delivered orders table
-                delivered_orders_query = "INSERT INTO delivered SELECT * FROM shipments WHERE \"OrderNumber\"=%s;"
-                cursor.execute(delivered_orders_query, (row['OrderNumber'],))
-                delete_query = "DELETE FROM shipments WHERE \"OrderNumber\"=%s;"
-                cursor.execute(delete_query, (row['OrderNumber'],))
-            elif is_problem_code:
-                if is_delayed:
-                    # Fetch the current state of the Delayed column
-                    fetch_delayed_query = "SELECT \"Delayed\" FROM shipments WHERE \"OrderNumber\"=%s;"
-                    cursor.execute(fetch_delayed_query, (row['OrderNumber'],))
-                    delayed_status = cursor.fetchone()
-
-                    # If the order is already marked as delayed, skip this iteration
-                    if delayed_status[0] == 'Yes':
-                        continue
-
-                # Compose email
-                subject_issue = config.email_subject_issues[status_code] if not is_stuck else "NO MOVT FOR 3 DAYS"
-                subject = f"[{subject_issue}] — Order #{row['OrderNumber']}"
-                email = Mail(
-                    from_email= config.from_email,
-                    to_emails= config.to_emails,
-                    subject=subject,
-                    html_content=f"""\
-                    <b><u>Customer name:</u></b><br>{row['CustomerName']}<br><br>
-                    <b><u>Order number:</u></b><br>{row['OrderNumber']}<br><br>
-                    <b><u>Ship date:</u></b><br>{row['ShippedDate']}<br><br>
-                    <b><u>Customer email:</u></b><br>{row['CustomerEmail']}<br><br>
-                    <b><u>Tracking number:</u></b><br>{row['TrackingNumber']}<br><br>
-                    <b><u>Status:</u></b><br>{new_status_entry}<br><br>
-                    """
-                )
-
                 try:
-                    # Send email
-                    response = sg.send(email)
-                    print(f"Email for order #{row['OrderNumber']} sent successfully.")
+                    delivered_query = "UPDATE shipments SET \"Delivered\"='Yes' WHERE \"OrderNumber\"=%s;"
+                    cursor.execute(delivered_query, (row['OrderNumber'],))
+                    # Move to delivered orders table
+                    try:
+                        delivered_orders_query = "INSERT INTO delivered SELECT * FROM shipments WHERE \"OrderNumber\"=%s;"
+                        cursor.execute(delivered_orders_query, (row['OrderNumber'],))
+                    except Error as e:
+                        print(f"Error moving order {row['OrderNumber']} to delivered orders: {e}")
 
-                    # If the email send operation was successful, update the database accordingly
-                    if is_delayed:
-                        # Set Delayed to 'Yes' in the database
-                        delayed_query = "UPDATE shipments SET \"Delayed\"='Yes' WHERE \"OrderNumber\"=%s;"
-                        cursor.execute(delayed_query, (row['OrderNumber'],))
-                    else:
-                        # Set NotificationSent to 'Yes' in the database
-                        notif_sent_query = "UPDATE shipments SET \"NotificationSent\"='Yes' WHERE \"OrderNumber\"=%s;"
-                        cursor.execute(notif_sent_query, (row['OrderNumber'],))
-
-                        # Move to problem_orders table and remove from shipments table
-                        problem_orders_query = "INSERT INTO problem_orders SELECT * FROM shipments WHERE \"OrderNumber\"=%s;"
-                        cursor.execute(problem_orders_query, (row['OrderNumber'],))
+                    try:
                         delete_query = "DELETE FROM shipments WHERE \"OrderNumber\"=%s;"
                         cursor.execute(delete_query, (row['OrderNumber'],))
+                    except Error as e:
+                        print(f"Error deleting order {row['OrderNumber']} from shipments: {e}")
+                    elif is_problem_code:
+                        if is_delayed:
+                            # Fetch the current state of the Delayed column
+                            try:
+                                fetch_delayed_query = "SELECT \"Delayed\" FROM shipments WHERE \"OrderNumber\"=%s;"
+                                cursor.execute(fetch_delayed_query, (row['OrderNumber'],))
+                                delayed_status = cursor.fetchone()
+                            except Error as e:
+                                print(f"Error fetching delayed status for order {row['OrderNumber']}: {e}")
+                                continue
+                            # If the order is already marked as delayed, skip this iteration
+                            if delayed_status[0] == 'Yes':
+                                continue
+                        # Compose email
+                        subject_issue = config.email_subject_issues[status_code] if not is_stuck else "NO MOVT FOR 3 DAYS"
+                        subject = f"[{subject_issue}] — Order #{row['OrderNumber']}"
+                        email = Mail(
+                            from_email= config.from_email,
+                            to_emails= config.to_emails,
+                            subject=subject,
+                            html_content=f"""\
+                            <b><u>Customer name:</u></b><br>{row['CustomerName']}<br><br>
+                            <b><u>Order number:</u></b><br>{row['OrderNumber']}<br><br>
+                            <b><u>Ship date:</u></b><br>{row['ShippedDate']}<br><br>
+                            <b><u>Customer email:</u></b><br>{row['CustomerEmail']}<br><br>
+                            <b><u>Tracking number:</u></b><br>{row['TrackingNumber']}<br><br>
+                            <b><u>Status:</u></b><br>{new_status_entry}<br><br>
+                            """
+                        )
+                        try:
+                            # Send email
+                            response = sg.send(email)
+                            print(f"Email for order #{row['OrderNumber']} sent successfully.")
+                            # If the email send operation was successful, update the database accordingly
+                            if is_delayed:
+                                # Set Delayed to 'Yes' in the database
+                                try:
+                                    delayed_query = "UPDATE shipments SET \"Delayed\"='Yes' WHERE \"OrderNumber\"=%s;"
+                                    cursor.execute(delayed_query, (row['OrderNumber'],))
+                                except Error as e:
+                                    print(f"Error updating delayed status for order {row['OrderNumber']}: {e}")
+                            else:
+                                # Set NotificationSent to 'Yes' in the database
+                                try:
+                                    notif_sent_query = "UPDATE shipments SET \"NotificationSent\"='Yes' WHERE \"OrderNumber\"=%s;"
+                                    cursor.execute(notif_sent_query, (row['OrderNumber'],))
+                                except Error as e:
+                                    print(f"Error updating notification status for order {row['OrderNumber']}: {e}")
+                                # Move to problem_orders table and remove from shipments table
+                                try:
+                                    problem_orders_query = "INSERT INTO problem_orders SELECT * FROM shipments WHERE \"OrderNumber\"=%s;"
+                                    cursor.execute(problem_orders_query, (row['OrderNumber'],))
+                                except Error as e:
+                                    print(f"Error moving order {row['OrderNumber']} to problem orders: {e}")
 
-                    # Count the problem codes for all orders with successful email sending
-                    problem_order_data.setdefault(new_status_entry, []).append(
-                        {
-                            'order_number': row['OrderNumber'],
-                            'customer_name': row['CustomerName'],
-                            'customer_email': row['CustomerEmail'],
-                            'tracking_number': row['TrackingNumber']
-                        }
-                    )
+                                try:
+                                    delete_query = "DELETE FROM shipments WHERE \"OrderNumber\"=%s;"
+                                    cursor.execute(delete_query, (row['OrderNumber'],))
+                                except Error as e:
+                                    print(f"Error deleting order {row['OrderNumber']} from shipments: {e}")
+                            # Count the problem codes for all orders with successful email sending
+                            problem_order_data.setdefault(new_status_entry, []).append(
+                                {
+                                    'order_number': row['OrderNumber'],
+                                    'customer_name': row['CustomerName'],
+                                    'customer_email': row['CustomerEmail'],
+                                    'tracking_number': row['TrackingNumber']
+                                }
+                            )
+                        except Exception as e:
+                            print(f"Error sending email for order {row['OrderNumber']}: {e}")
 
-                except Exception as e:
-                    print(f"Error sending email for order {row['OrderNumber']}: {e}")
+
 
 
         except Exception as e:
