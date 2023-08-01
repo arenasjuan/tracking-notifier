@@ -76,7 +76,7 @@ def lambda_handler(event, context):
             else:
                 num_new_entries = len(database_entries)
 
-                print(f"Adding {len(num_new_entries)} shipments from new shipment batch to database")
+                print(f"Adding {num_new_entries} shipments from new shipment batch to database")
                 print(f"Full batch for reference: {database_entries}")
                 # Iterate over the entries
 
@@ -87,9 +87,9 @@ def lambda_handler(event, context):
                     # Prepare the SQL statement
                     sql = '''
                         INSERT INTO "shipments" ("OrderNumber", "CustomerName", "CustomerEmail", "TrackingNumber", "CarrierName", "ShippedDate", "StatusCode", "LastLocation", "DaysAtLastLocation", "NotificationSent", "Delayed", "Delivered")
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT ("TrackingNumber") DO NOTHING;
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
                     '''
+
 
                     # Create a tuple with all the values to insert
                     data = (entry['OrderNumber'], entry['CustomerName'], entry['CustomerEmail'], entry['TrackingNumber'], entry['CarrierName'], entry['ShippedDate'], entry['StatusCode'], entry['LastLocation'], entry['DaysAtLastLocation'], entry['NotificationSent'], entry['Delayed'], entry['Delivered'])
@@ -100,7 +100,7 @@ def lambda_handler(event, context):
                 # Commit the changes
                 cnx.commit()
 
-    return
+        return
 
 
 
@@ -120,6 +120,7 @@ def lambda_handler(event, context):
     processed_shipments = 0
     errors = 0
     error_orders = []
+    delivered = 0
 
 
     for row in cursor.fetchall():
@@ -225,98 +226,99 @@ def lambda_handler(event, context):
                                 except (Error, psycopg2.ProgrammingError, psycopg2.OperationalError) as e:
                                     print(f"Database error occurred while updating last location date: {e}")
                                     continue
-                    else:
-                        print(f"No record found for order: {row['OrderNumber']}")
-                        continue
-                except Exception as e:
-                    print(f"Error processing order {row['OrderNumber']}: {e}")
-                if is_delivered:
+                else:
+                    print(f"No record found for order: {row['OrderNumber']}")
+                    continue
+            except Exception as e:
+                print(f"Error processing order {row['OrderNumber']}: {e}")
+            if is_delivered:
+                delivered += 1
+                try:
+                    delivered_query = "UPDATE shipments SET \"Delivered\"='Yes' WHERE \"OrderNumber\"=%s;"
+                    cursor.execute(delivered_query, (row['OrderNumber'],))
+                    # Move to delivered orders table
                     try:
-                        delivered_query = "UPDATE shipments SET \"Delivered\"='Yes' WHERE \"OrderNumber\"=%s;"
-                        cursor.execute(delivered_query, (row['OrderNumber'],))
-                        # Move to delivered orders table
+                        delivered_orders_query = "INSERT INTO delivered SELECT * FROM shipments WHERE \"OrderNumber\"=%s;"
+                        cursor.execute(delivered_orders_query, (row['OrderNumber'],))
+                    except Error as e:
+                        print(f"Error moving order {row['OrderNumber']} to delivered orders: {e}")
+                    try:
+                        delete_query = "DELETE FROM shipments WHERE \"OrderNumber\"=%s;"
+                        cursor.execute(delete_query, (row['OrderNumber'],))
+                    except Error as e:
+                        print(f"Error deleting order {row['OrderNumber']} from shipments: {e}")
+                except Error as e:
+                    print(f"Error setting order {row['OrderNumber']} as delivered: {e}")
+            elif is_problem_code:
+                if is_delayed:
+                    # Fetch the current state of the Delayed column
+                    try:
+                        fetch_delayed_query = "SELECT \"Delayed\" FROM shipments WHERE \"OrderNumber\"=%s;"
+                        cursor.execute(fetch_delayed_query, (row['OrderNumber'],))
+                        delayed_status = cursor.fetchone()
+                    except Error as e:
+                        print(f"Error fetching delayed status for order {row['OrderNumber']}: {e}")
+                        continue
+                    # If the order is already marked as delayed, skip this iteration
+                    if delayed_status[0] == 'Yes':
+                        continue
+                # Compose email
+                subject_issue = config.email_subject_issues[status_code] if not is_stuck else "NO MOVT FOR 3 DAYS"
+                subject = f"[{subject_issue}] — Order #{row['OrderNumber']}"
+                email = Mail(
+                    from_email= config.from_email,
+                    to_emails= config.to_emails,
+                    subject=subject,
+                    html_content=f"""\
+                    <b><u>Customer name:</u></b><br>{row['CustomerName']}<br><br>
+                    <b><u>Order number:</u></b><br>{row['OrderNumber']}<br><br>
+                    <b><u>Ship date:</u></b><br>{row['ShippedDate']}<br><br>
+                    <b><u>Customer email:</u></b><br>{row['CustomerEmail']}<br><br>
+                    <b><u>Tracking number:</u></b><br>{row['TrackingNumber']}<br><br>
+                    <b><u>Status:</u></b><br>{new_status_entry}<br><br>
+                    """
+                )
+                try:
+                    # Send email
+                    response = sg.send(email)
+                    print(f"Email for order #{row['OrderNumber']} sent successfully.")
+                    # If the email send operation was successful, update the database accordingly
+                    if is_delayed:
+                        # Set Delayed to 'Yes' in the database
                         try:
-                            delivered_orders_query = "INSERT INTO delivered SELECT * FROM shipments WHERE \"OrderNumber\"=%s;"
-                            cursor.execute(delivered_orders_query, (row['OrderNumber'],))
+                            delayed_query = "UPDATE shipments SET \"Delayed\"='Yes' WHERE \"OrderNumber\"=%s;"
+                            cursor.execute(delayed_query, (row['OrderNumber'],))
                         except Error as e:
-                            print(f"Error moving order {row['OrderNumber']} to delivered orders: {e}")
+                            print(f"Error updating delayed status for order {row['OrderNumber']}: {e}")
+                    else:
+                        # Set NotificationSent to 'Yes' in the database
+                        try:
+                            notif_sent_query = "UPDATE shipments SET \"NotificationSent\"='Yes' WHERE \"OrderNumber\"=%s;"
+                            cursor.execute(notif_sent_query, (row['OrderNumber'],))
+                        except Error as e:
+                            print(f"Error updating notification status for order {row['OrderNumber']}: {e}")
+                        # Move to problem_orders table and remove from shipments table
+                        try:
+                            problem_orders_query = "INSERT INTO problem_orders SELECT * FROM shipments WHERE \"OrderNumber\"=%s;"
+                            cursor.execute(problem_orders_query, (row['OrderNumber'],))
+                        except Error as e:
+                            print(f"Error moving order {row['OrderNumber']} to problem orders: {e}")
                         try:
                             delete_query = "DELETE FROM shipments WHERE \"OrderNumber\"=%s;"
                             cursor.execute(delete_query, (row['OrderNumber'],))
                         except Error as e:
                             print(f"Error deleting order {row['OrderNumber']} from shipments: {e}")
-                    except Error as e:
-                        print(f"Error setting order {row['OrderNumber']} as delivered: {e}")
-                elif is_problem_code:
-                    if is_delayed:
-                        # Fetch the current state of the Delayed column
-                        try:
-                            fetch_delayed_query = "SELECT \"Delayed\" FROM shipments WHERE \"OrderNumber\"=%s;"
-                            cursor.execute(fetch_delayed_query, (row['OrderNumber'],))
-                            delayed_status = cursor.fetchone()
-                        except Error as e:
-                            print(f"Error fetching delayed status for order {row['OrderNumber']}: {e}")
-                            continue
-                        # If the order is already marked as delayed, skip this iteration
-                        if delayed_status[0] == 'Yes':
-                            continue
-                    # Compose email
-                    subject_issue = config.email_subject_issues[status_code] if not is_stuck else "NO MOVT FOR 3 DAYS"
-                    subject = f"[{subject_issue}] — Order #{row['OrderNumber']}"
-                    email = Mail(
-                        from_email= config.from_email,
-                        to_emails= config.to_emails,
-                        subject=subject,
-                        html_content=f"""\
-                        <b><u>Customer name:</u></b><br>{row['CustomerName']}<br><br>
-                        <b><u>Order number:</u></b><br>{row['OrderNumber']}<br><br>
-                        <b><u>Ship date:</u></b><br>{row['ShippedDate']}<br><br>
-                        <b><u>Customer email:</u></b><br>{row['CustomerEmail']}<br><br>
-                        <b><u>Tracking number:</u></b><br>{row['TrackingNumber']}<br><br>
-                        <b><u>Status:</u></b><br>{new_status_entry}<br><br>
-                        """
+                    # Count the problem codes for all orders with successful email sending
+                    problem_order_data.setdefault(new_status_entry, []).append(
+                        {
+                            'order_number': row['OrderNumber'],
+                            'customer_name': row['CustomerName'],
+                            'customer_email': row['CustomerEmail'],
+                            'tracking_number': row['TrackingNumber']
+                        }
                     )
-                    try:
-                        # Send email
-                        response = sg.send(email)
-                        print(f"Email for order #{row['OrderNumber']} sent successfully.")
-                        # If the email send operation was successful, update the database accordingly
-                        if is_delayed:
-                            # Set Delayed to 'Yes' in the database
-                            try:
-                                delayed_query = "UPDATE shipments SET \"Delayed\"='Yes' WHERE \"OrderNumber\"=%s;"
-                                cursor.execute(delayed_query, (row['OrderNumber'],))
-                            except Error as e:
-                                print(f"Error updating delayed status for order {row['OrderNumber']}: {e}")
-                        else:
-                            # Set NotificationSent to 'Yes' in the database
-                            try:
-                                notif_sent_query = "UPDATE shipments SET \"NotificationSent\"='Yes' WHERE \"OrderNumber\"=%s;"
-                                cursor.execute(notif_sent_query, (row['OrderNumber'],))
-                            except Error as e:
-                                print(f"Error updating notification status for order {row['OrderNumber']}: {e}")
-                            # Move to problem_orders table and remove from shipments table
-                            try:
-                                problem_orders_query = "INSERT INTO problem_orders SELECT * FROM shipments WHERE \"OrderNumber\"=%s;"
-                                cursor.execute(problem_orders_query, (row['OrderNumber'],))
-                            except Error as e:
-                                print(f"Error moving order {row['OrderNumber']} to problem orders: {e}")
-                            try:
-                                delete_query = "DELETE FROM shipments WHERE \"OrderNumber\"=%s;"
-                                cursor.execute(delete_query, (row['OrderNumber'],))
-                            except Error as e:
-                                print(f"Error deleting order {row['OrderNumber']} from shipments: {e}")
-                        # Count the problem codes for all orders with successful email sending
-                        problem_order_data.setdefault(new_status_entry, []).append(
-                            {
-                                'order_number': row['OrderNumber'],
-                                'customer_name': row['CustomerName'],
-                                'customer_email': row['CustomerEmail'],
-                                'tracking_number': row['TrackingNumber']
-                            }
-                        )
-                    except Exception as e:
-                        print(f"Error sending email for order {row['OrderNumber']}: {e}")
+                except Exception as e:
+                    print(f"Error sending email for order {row['OrderNumber']}: {e}")
 
 
         except Exception as e:
@@ -326,21 +328,22 @@ def lambda_handler(event, context):
             continue
     # Sending final progress report email.
     report_content = f"""\
-    <u><h2>Processing Counts</h2></u><br><br>
-    # of Orders Processed: {total_shipments}
-    # of Problem Orders: {sum(len(v) for v in problem_order_data.values())}
+    <u><b>Processing Counts</b></u><br><br>
+    # of Orders Processed: {total_shipments}<br>
+    # of Orders Delivered: {delivered}<br>
+    # of Problem Orders: {sum(len(v) for v in problem_order_data.values())}<br>
     # of Orders with Tracking Errors: {errors}<br><br>
-    <u><h2>Problem Code Counts</h2></u>
+    <u><b><Problem Code Counts</b></u>
     """
     for code, orders in problem_order_data.items():
-        report_content += f"<br><b><u>{code}:</u></b> — {len(orders)}"
+        report_content += f"<br><u>{code}</u> — <b>{len(orders)}</b>"
         report_content += "<ul>"
         for order in orders:
             report_content += f"<li>#{order['order_number']}: {order['customer_name']} ({order['customer_email']}) — {order['tracking_number']}</li>"
         report_content += "</ul>"
 
     if error_orders:
-        report_content += "<br><br><u><h2>Ran into tracking errors with the following order(s):</h2></u><br><ul>"
+        report_content += "<br><br><u><b>Ran into tracking errors with the following order(s):</b></u><br><ul>"
         for order_number, customer, tracking in error_orders:
             report_content += f"<li>#{order_number} {customer}: {tracking}</li>"
         report_content += "</ul>"
