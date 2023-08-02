@@ -53,6 +53,32 @@ def lambda_handler(event, context):
         data = response.json()
         return str(data["access_token"])
 
+    def generate_order_rows(code, orders, bg_color, stuck=False):
+        if stuck:
+            code = code[5:]
+
+        order_rows = f"""
+            <tr style="background-color: {bg_color};">
+                <td rowspan="{len(orders)}" style="width: 20%; border: 1px solid black; padding: 5px;"><b>{code}</b></td>
+                <td style="border: 1px solid black; padding: 5px;">{orders[0]['order_number']}</td>
+                <td style="border: 1px solid black; padding: 5px;">{orders[0]['tracking_number']}</td>
+                <td style="border: 1px solid black; padding: 5px;">{orders[0]['shipped_date']}</td>
+                <td style="border: 1px solid black; padding: 5px;">{orders[0]['customer_name']}</td>
+                <td style="border: 1px solid black; padding: 5px;">{orders[0]['customer_email']}</td>
+            </tr>
+        """
+        for order in orders[1:]:
+            order_rows += f"""
+                <tr style="background-color: {bg_color};">
+                    <td style="border: 1px solid black; padding: 5px;">{order['order_number']}</td>
+                    <td style="border: 1px solid black; padding: 5px;">{order['tracking_number']}</td>
+                    <td style="border: 1px solid black; padding: 5px;">{order['shipped_date']}</td>
+                    <td style="border: 1px solid black; padding: 5px;">{order['customer_name']}</td>
+                    <td style="border: 1px solid black; padding: 5px;">{order['customer_email']}</td>
+                </tr>
+            """
+        return order_rows
+
     cnx = connect(
         dbname=config.dbname, 
         user=config.user, 
@@ -107,12 +133,14 @@ def lambda_handler(event, context):
     auth_token = get_ups_token()
 
     # SendGrid setup
-    sg = SendGridAPIClient(config.SENDGRID_API_KEY)
+    sg = SendGridAPIClient(config.ALCHEMIST_SENDGRID_API_KEY)
 
     # Select data from database
     query = "SELECT * FROM shipments"
     cursor.execute(query)
     problem_order_data = {}
+    delay_order_data = {}
+    stuck_order_data = {}
     count_query = "SELECT COUNT(*) FROM shipments;"
     cursor.execute(count_query)
     total_shipments = cursor.fetchone()[0]
@@ -127,7 +155,6 @@ def lambda_handler(event, context):
         processed_shipments += 1
         print(f"Processing shipment {processed_shipments} out of {total_shipments}")
         try:
-            print(list(row.keys()))
             tracking_number = row['TrackingNumber']
             # Make a request to the UPS tracking API
             try:
@@ -166,7 +193,6 @@ def lambda_handler(event, context):
             is_delivered = status_code in config.delivered_codes
             is_problem_code = status_code in config.problem_codes_ups
             is_delayed = status_code in config.delay_codes
-            is_stuck = False
 
             # Update the StatusCode in the database
             try:
@@ -184,7 +210,6 @@ def lambda_handler(event, context):
             # Process current location
             try:
                 current_location = activity['location']['address']['city']
-                # Fetch the previous location and the date it was updated
                 try:
                     fetch_location_query = "SELECT \"LastLocation\", \"LastLocationDate\" FROM shipments WHERE \"OrderNumber\"=%s;"
                     cursor.execute(fetch_location_query, (row['OrderNumber'],))
@@ -192,16 +217,16 @@ def lambda_handler(event, context):
                 except (Error, psycopg2.ProgrammingError, psycopg2.OperationalError) as e:
                     print(f"Database error occurred while fetching location: {e}")
                     continue
-                # Check if a row was returned from the database
                 if result is not None:
                     previous_location, previous_location_date = result
                     # Check if LastLocation exists
                     if previous_location:
                         if current_location != previous_location:
-                            # Update LastLocation, set LastLocationDate to current date and DaysAtLastLocation to 0
+                            # Update LastLocation, set LastLocationDate to activity date and DaysAtLastLocation to the difference between activity date and current date
                             try:
-                                update_query = "UPDATE shipments SET \"LastLocation\"=%s, \"LastLocationDate\"=%s, \"DaysAtLastLocation\"=0 WHERE \"OrderNumber\"=%s;"
-                                cursor.execute(update_query, (current_location, current_date, row['OrderNumber']))
+                                days_at_location = calculate_days(activity['date'], current_date)
+                                update_query = "UPDATE shipments SET \"LastLocation\"=%s, \"LastLocationDate\"=%s, \"DaysAtLastLocation\"=%s WHERE \"OrderNumber\"=%s;"
+                                cursor.execute(update_query, (current_location, activity['date'], days_at_location, row['OrderNumber']))
                             except (Error, psycopg2.ProgrammingError, psycopg2.OperationalError) as e:
                                 print(f"Database error occurred while updating last location: {e}")
                                 continue
@@ -215,9 +240,45 @@ def lambda_handler(event, context):
                                 except (Error, psycopg2.ProgrammingError, psycopg2.OperationalError) as e:
                                     print(f"Database error occurred while updating days at last location: {e}")
                                     continue
-                                if days_at_location >= 3:
-                                    is_problem_code = True
-                                    is_stuck = True
+                                if days_at_location == 3:
+                                    if days_at_location >= 5:
+                                        is_problem_code = True
+                                        stuck_order_data.setdefault('999: 5 DAYS NO MOVT', []).append(
+                                            {
+                                                'order_number': row['OrderNumber'],
+                                                'customer_name': row['CustomerName'],
+                                                'customer_email': row['CustomerEmail'],
+                                                'tracking_number': row['TrackingNumber'],
+                                                'shipped_date': row['ShippedDate']
+                                            }
+                                        )
+                                        try:
+                                            notification_query = "UPDATE shipments SET \"NotificationSent\"='Yes' WHERE \"OrderNumber\"=%s;"
+                                            cursor.execute(notification_query, (row['OrderNumber'],))
+                                        except Error as e:
+                                            print(f"Error updating notification status for order {row['OrderNumber']}: {e}")
+                                        try:
+                                            problem_orders_query = "INSERT INTO problem_orders SELECT * FROM shipments WHERE \"OrderNumber\"=%s;"
+                                            cursor.execute(problem_orders_query, (row['OrderNumber'],))
+                                        except Error as e:
+                                            print(f"Error moving order {row['OrderNumber']} to problem orders: {e}")
+                                        try:
+                                            delete_query = "DELETE FROM shipments WHERE \"OrderNumber\"=%s;"
+                                            cursor.execute(delete_query, (row['OrderNumber'],))
+                                        except Error as e:
+                                            print(f"Error deleting order {row['OrderNumber']} from shipments: {e}")
+
+                                    else:
+                                       stuck_order_data.setdefault('998: 3 DAYS NO MOVT', []).append(
+                                            {
+                                                'order_number': row['OrderNumber'],
+                                                'customer_name': row['CustomerName'],
+                                                'customer_email': row['CustomerEmail'],
+                                                'tracking_number': row['TrackingNumber'],
+                                                'shipped_date': row['ShippedDate']
+                                            }
+                                        )
+
                             else:
                                 # If LastLocationDate is None, set it to the current date and DaysAtLastLocation to 0
                                 try:
@@ -226,6 +287,7 @@ def lambda_handler(event, context):
                                 except (Error, psycopg2.ProgrammingError, psycopg2.OperationalError) as e:
                                     print(f"Database error occurred while updating last location date: {e}")
                                     continue
+
                 else:
                     print(f"No record found for order: {row['OrderNumber']}")
                     continue
@@ -262,63 +324,46 @@ def lambda_handler(event, context):
                     # If the order is already marked as delayed, skip this iteration
                     if delayed_status[0] == 'Yes':
                         continue
-                # Compose email
-                subject_issue = config.email_subject_issues[status_code] if not is_stuck else "NO MOVT FOR 3 DAYS"
-                subject = f"[{subject_issue}] — Order #{row['OrderNumber']}"
-                email = Mail(
-                    from_email= config.from_email,
-                    to_emails= config.to_emails,
-                    subject=subject,
-                    html_content=f"""\
-                    <b><u>Customer name:</u></b><br>{row['CustomerName']}<br><br>
-                    <b><u>Order number:</u></b><br>{row['OrderNumber']}<br><br>
-                    <b><u>Ship date:</u></b><br>{row['ShippedDate']}<br><br>
-                    <b><u>Customer email:</u></b><br>{row['CustomerEmail']}<br><br>
-                    <b><u>Tracking number:</u></b><br>{row['TrackingNumber']}<br><br>
-                    <b><u>Status:</u></b><br>{new_status_entry}<br><br>
-                    """
-                )
-                try:
-                    # Send email
-                    response = sg.send(email)
-                    print(f"Email for order #{row['OrderNumber']} sent successfully.")
-                    # If the email send operation was successful, update the database accordingly
-                    if is_delayed:
-                        # Set Delayed to 'Yes' in the database
-                        try:
-                            delayed_query = "UPDATE shipments SET \"Delayed\"='Yes' WHERE \"OrderNumber\"=%s;"
-                            cursor.execute(delayed_query, (row['OrderNumber'],))
-                        except Error as e:
-                            print(f"Error updating delayed status for order {row['OrderNumber']}: {e}")
-                    else:
-                        # Set NotificationSent to 'Yes' in the database
-                        try:
-                            notif_sent_query = "UPDATE shipments SET \"NotificationSent\"='Yes' WHERE \"OrderNumber\"=%s;"
-                            cursor.execute(notif_sent_query, (row['OrderNumber'],))
-                        except Error as e:
-                            print(f"Error updating notification status for order {row['OrderNumber']}: {e}")
-                        # Move to problem_orders table and remove from shipments table
-                        try:
-                            problem_orders_query = "INSERT INTO problem_orders SELECT * FROM shipments WHERE \"OrderNumber\"=%s;"
-                            cursor.execute(problem_orders_query, (row['OrderNumber'],))
-                        except Error as e:
-                            print(f"Error moving order {row['OrderNumber']} to problem orders: {e}")
-                        try:
-                            delete_query = "DELETE FROM shipments WHERE \"OrderNumber\"=%s;"
-                            cursor.execute(delete_query, (row['OrderNumber'],))
-                        except Error as e:
-                            print(f"Error deleting order {row['OrderNumber']} from shipments: {e}")
-                    # Count the problem codes for all orders with successful email sending
+                    try:
+                        delayed_query = "UPDATE shipments SET \"Delayed\"='Yes' WHERE \"OrderNumber\"=%s;"
+                        cursor.execute(delayed_query, (row['OrderNumber'],))
+                    except Error as e:
+                        print(f"Error updating delayed status for order {row['OrderNumber']}: {e}")
+                    delay_order_data.setdefault(new_status_entry, []).append(
+                        {
+                            'order_number': row['OrderNumber'],
+                            'customer_name': row['CustomerName'],
+                            'customer_email': row['CustomerEmail'],
+                            'tracking_number': row['TrackingNumber'],
+                            'shipped_date': row['ShippedDate']
+                        }
+                    )
+                else:
+                    try:
+                        notification_query = "UPDATE shipments SET \"NotificationSent\"='Yes' WHERE \"OrderNumber\"=%s;"
+                        cursor.execute(notification_query, (row['OrderNumber'],))
+                    except Error as e:
+                        print(f"Error updating notification status for order {row['OrderNumber']}: {e}")
+                    try:
+                        problem_orders_query = "INSERT INTO problem_orders SELECT * FROM shipments WHERE \"OrderNumber\"=%s;"
+                        cursor.execute(problem_orders_query, (row['OrderNumber'],))
+                    except Error as e:
+                        print(f"Error moving order {row['OrderNumber']} to problem orders: {e}")
+                    try:
+                        delete_query = "DELETE FROM shipments WHERE \"OrderNumber\"=%s;"
+                        cursor.execute(delete_query, (row['OrderNumber'],))
+                    except Error as e:
+                        print(f"Error deleting order {row['OrderNumber']} from shipments: {e}")
+                
                     problem_order_data.setdefault(new_status_entry, []).append(
                         {
                             'order_number': row['OrderNumber'],
                             'customer_name': row['CustomerName'],
                             'customer_email': row['CustomerEmail'],
-                            'tracking_number': row['TrackingNumber']
+                            'tracking_number': row['TrackingNumber'],
+                            'shipped_date': row['ShippedDate']
                         }
                     )
-                except Exception as e:
-                    print(f"Error sending email for order {row['OrderNumber']}: {e}")
 
 
         except Exception as e:
@@ -326,21 +371,47 @@ def lambda_handler(event, context):
             error_orders.append((row['OrderNumber'], row['CustomerName'], row['TrackingNumber']))
             print(f"Exception caught by master try-except block: {e}")
             continue
-    # Sending final progress report email.
+
+    total_problem_orders = sum(len(v) for v in problem_order_data.values()) + sum(len(v) for v in delay_order_data.values()) + sum(len(v) for v in stuck_order_data.values())
+
     report_content = f"""\
-    <u><b>Processing Counts</b></u><br><br>
+    <br><u><b>Processing Counts</b></u><br>
     # of Orders Processed: {total_shipments}<br>
     # of Orders Delivered: {delivered}<br>
-    # of Problem Orders: {sum(len(v) for v in problem_order_data.values())}<br>
+    # of Problem Orders: {total_problem_orders}<br>
     # of Orders with Tracking Errors: {errors}<br><br>
-    <u><b><Problem Code Counts</b></u>
+    <table style="width: 100%; border: 1px solid black;">
+        <tr><th colspan="6" style="font-size:18px;">Problem Orders</th></tr>
+        <tr>
+            <th style="border: 1px solid black; padding: 5px;">Problem Code</th>
+            <th style="border: 1px solid black; padding: 5px;">Order Number</th>
+            <th style="border: 1px solid black; padding: 5px;">Tracking Number</th>
+            <th style="border: 1px solid black; padding: 5px;">Ship Date</th>
+            <th style="border: 1px solid black; padding: 5px;">Customer Name</th>
+            <th style="border: 1px solid black; padding: 5px;">Customer Email</th>
+        </tr>
     """
+
+    # Handle stuck orders first
+    for code, orders in stuck_order_data.items():
+        color_key = code[:3]
+        bg_color = config.email_color_codes.get(color_key, "#ffffff")
+        report_content += generate_order_rows(code, orders, bg_color, True)
+
+    # Handle non-delayed problem orders
     for code, orders in problem_order_data.items():
-        report_content += f"<br><u>{code}</u> — <b>{len(orders)}</b>"
-        report_content += "<ul>"
-        for order in orders:
-            report_content += f"<li>#{order['order_number']}: {order['customer_name']} ({order['customer_email']}) — {order['tracking_number']}</li>"
-        report_content += "</ul>"
+        color_key = code[:3]
+        bg_color = config.email_color_codes.get(color_key, "#ffffff")
+        report_content += generate_order_rows(code, orders, bg_color)
+
+    # Handle delayed problem orders
+    for code, orders in delay_order_data.items():
+        color_key = code[:3]
+        bg_color = config.email_color_codes.get(color_key, "#ffffff")
+        report_content += generate_order_rows(code, orders, bg_color)
+
+    report_content += "</table>"
+
 
     if error_orders:
         report_content += "<br><br><u><b>Ran into tracking errors with the following order(s):</b></u><br><ul>"
