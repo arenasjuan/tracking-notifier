@@ -56,6 +56,8 @@ def lambda_handler(event, context):
     def generate_order_rows(code, orders, bg_color, stuck=False):
         if stuck:
             code = code[5:]
+        elif code[:3] == '003':
+            code = "Status Stuck at 'Shipment Ready for UPS'"
 
         order_rows = f"""
             <tr style="background-color: {bg_color};">
@@ -89,10 +91,8 @@ def lambda_handler(event, context):
     cursor = cnx.cursor(cursor_factory=extras.DictCursor)
 
     if 'body' in event:
-        # Load event body content
         event_body = json.loads(event['body'])
 
-        # If we received database entries, add them to the database
         if "database_entries" in event_body:
             print("Received database entries list")
             database_entries = event_body['database_entries']
@@ -104,31 +104,30 @@ def lambda_handler(event, context):
 
                 print(f"Adding {num_new_entries} shipments from new shipment batch to database")
                 print(f"Full batch for reference: {database_entries}")
-                # Iterate over the entries
 
                 counter = 0
                 for entry in database_entries:
                     counter += 1
                     print(f"Processing order {counter} of {num_new_entries}")
-                    # Prepare the SQL statement
+
+                    # Check if the OrderNumber already exists in the table
+                    cursor.execute("SELECT 1 FROM shipments WHERE OrderNumber = %s", (entry['OrderNumber'],))
+                    if cursor.fetchone():
+                        print(f"Order {entry['OrderNumber']} already exists. Skipping.")
+                        continue
+                    
                     sql = '''
                         INSERT INTO "shipments" ("OrderNumber", "CustomerName", "CustomerEmail", "TrackingNumber", "CarrierName", "ShippedDate", "StatusCode", "LastLocation", "DaysAtLastLocation", "NotificationSent", "Delayed", "Delivered")
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
                     '''
 
-
-                    # Create a tuple with all the values to insert
                     data = (entry['OrderNumber'], entry['CustomerName'], entry['CustomerEmail'], entry['TrackingNumber'], entry['CarrierName'], entry['ShippedDate'], entry['StatusCode'], entry['LastLocation'], entry['DaysAtLastLocation'], entry['NotificationSent'], entry['Delayed'], entry['Delivered'])
 
-                    # Execute the SQL statement
                     cursor.execute(sql, data)
-                
-                # Commit the changes
+                    
                 cnx.commit()
 
         return
-
-
 
     auth_token = get_ups_token()
 
@@ -243,7 +242,7 @@ def lambda_handler(event, context):
                                 if days_at_location == 3:
                                     if days_at_location >= 5:
                                         is_problem_code = True
-                                        stuck_order_data.setdefault('999: 5 DAYS NO MOVT', []).append(
+                                        stuck_order_data.setdefault('999: (WARNING) 5 Business Days without a Location Update', []).append(
                                             {
                                                 'order_number': row['OrderNumber'],
                                                 'customer_name': row['CustomerName'],
@@ -269,7 +268,7 @@ def lambda_handler(event, context):
                                             print(f"Error deleting order {row['OrderNumber']} from shipments: {e}")
 
                                     else:
-                                       stuck_order_data.setdefault('998: 3 DAYS NO MOVT', []).append(
+                                       stuck_order_data.setdefault('998: (WARNING) 3 Business Days without a Location Update', []).append(
                                             {
                                                 'order_number': row['OrderNumber'],
                                                 'customer_name': row['CustomerName'],
@@ -414,12 +413,12 @@ def lambda_handler(event, context):
 
 
     if error_orders:
-        report_content += "<br><br><u><b>Ran into tracking errors with the following order(s):</b></u><br><ul>"
+        report_content += "<br><br><u><b>Ran into errors when trying to track the following order(s):</b></u><br><ul>"
         for order_number, customer, tracking in error_orders:
             report_content += f"<li>#{order_number} {customer}: {tracking}</li>"
         report_content += "</ul>"
 
-    subject_line = f"[TRACKING EXECUTION REPORT] {now.strftime('%m-%d-%Y')} {time_of_day}"
+    subject_line = f"[TRACKING REPORT] {now.strftime('%m-%d-%Y')} {time_of_day}"
     report_email = Mail(
         from_email= config.from_email,
         to_emails= config.to_emails,
