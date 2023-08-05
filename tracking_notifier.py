@@ -32,8 +32,6 @@ def lambda_handler(event, context):
     )
     cursor = cnx.cursor(cursor_factory=extras.DictCursor)
 
-    auth_token = get_ups_token()
-
     # SendGrid setup
     sg = SendGridAPIClient(config.ALCHEMIST_SENDGRID_API_KEY)
 
@@ -51,13 +49,14 @@ def lambda_handler(event, context):
     errors = 0
     error_orders = []
     delivered = 0
-    
+
 
     def calculate_days(date1, date2):
-        date2 = datetime.datetime.strptime(date2, "%Y%m%d").date()
-            
+        if isinstance(date1, str):
+            date1 = datetime.datetime.strptime(date1, "%Y%m%d").date()
+
         start = date1
-        end = date2
+        end = date2.date()
         step = datetime.timedelta(days=1)
         count = 0
         while start <= end:
@@ -207,6 +206,8 @@ def lambda_handler(event, context):
 
         return
 
+    auth_token = get_ups_token()
+
 
     for row in cursor.fetchall():
         processed_shipments += 1
@@ -254,7 +255,7 @@ def lambda_handler(event, context):
             # Update the StatusCode in the database
             column_update(cursor, row['OrderNumber'], {"StatusCode": new_status_entry})
 
-            current_date = datetime.datetime.now(tz_us_pacific).strftime("%Y%m%d")
+            current_date = datetime.datetime.now(tz_us_pacific)
             # Check for '003' status code and days since shipment
             if status_code == '003' and calculate_days(row['ShippedDate'], current_date) > 2:
                 is_problem_code = True
@@ -277,18 +278,17 @@ def lambda_handler(event, context):
                                 days_at_location = calculate_days(previous_location_date, current_date)
                                 column_update(cursor, row['OrderNumber'], {"DaysAtLastLocation": days_at_location})
                                 if days_at_location >= 3:
-                                    if days_at_location >= 5:
-                                        is_problem_code = True
+                                    notification_status = fetch_column_value(cursor, row['OrderNumber'], "NotificationSent")
+                                    if days_at_location >= 5 and notification_status == 'No':
                                         add_to_email(stuck_order_data, '999: (WARNING) 5 Business Days without a Location Update', row)
-                                        move_row(cursor, row['OrderNumber'], "shipments", "problem_orders")
+                                        move_row(cursor, row['OrderNumber'], "shipments", "problem_orders", True)
 
                                     elif days_at_location == 3:
-                                        notification_status = fetch_column_value(cursor, row['OrderNumber'], "NotificationSent")
-                                        # If the order is already marked as delayed, skip this iteration
                                         if notification_status == 'No':
-                                            is_problem_code = True
-                                            add_to_email(stuck_order_data, '999: (WARNING) 5 Business Days without a Location Update', row)
-                                            move_row(cursor, row['OrderNumber'], "shipments", "problem_orders", True)
+                                            add_to_email(stuck_order_data, '998: (WARNING) 3 Business Days without a Location Update', row)
+                                            column_update(cursor, row['OrderNumber'], {"NotificationSent": 'Yes'})
+                                        else:
+                                            column_update(cursor, row['OrderNumber'], {"NotificationSent": 'No'})
 
                             else:
                                 # If LastLocationDate is None, set it to the current date and DaysAtLastLocation to 0
@@ -377,6 +377,11 @@ def lambda_handler(event, context):
         subject=subject_line,
         html_content=report_content
     )
+
+    print(f"Stuck shipments: {stuck_order_data}")
+    print(f"Problem shipments: {problem_order_data}")
+    print(f"Delay shipments: {delay_order_data}")
+
     try:
         response = sg.send(report_email)
         print("Execution report email sent successfully.")
