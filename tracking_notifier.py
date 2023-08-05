@@ -277,15 +277,17 @@ def lambda_handler(event, context):
                             if previous_location_date is not None:
                                 days_at_location = calculate_days(previous_location_date, current_date)
                                 column_update(cursor, row['OrderNumber'], {"DaysAtLastLocation": days_at_location})
-                                if days_at_location >= 3:
+
+                                # If shipment hasn't moved, only address it if it has no estimated delivery date
+                                if days_at_location >= 3 and not package_details['deliveryDate']:
                                     notification_status = fetch_column_value(cursor, row['OrderNumber'], "NotificationSent")
                                     if days_at_location >= 5 and notification_status == 'No':
-                                        add_to_email(stuck_order_data, '999: (WARNING) 5 Business Days without a Location Update', row)
+                                        add_to_email(stuck_order_data, '999: 5 Business Days without a Location Update, and No Delivery Date Found', row)
                                         move_row(cursor, row['OrderNumber'], "shipments", "problem_orders", True)
 
                                     elif days_at_location == 3:
                                         if notification_status == 'No':
-                                            add_to_email(stuck_order_data, '998: (WARNING) 3 Business Days without a Location Update', row)
+                                            add_to_email(stuck_order_data, '998: 3 Business Days without a Location Update, and No Delivery Date Found', row)
                                             column_update(cursor, row['OrderNumber'], {"NotificationSent": 'Yes'})
                                         else:
                                             column_update(cursor, row['OrderNumber'], {"NotificationSent": 'No'})
@@ -313,8 +315,8 @@ def lambda_handler(event, context):
                         add_to_email(delay_order_data, new_status_entry, row)
                         column_update(cursor, row['OrderNumber'], {"Delayed": 'Yes'})
                 else:
-                    move_row(cursor, row['OrderNumber'], "shipments", "problem_orders", True)
                     add_to_email(problem_order_data, new_status_entry, row)
+                    move_row(cursor, row['OrderNumber'], "shipments", "problem_orders", True)
 
 
         except Exception as e:
