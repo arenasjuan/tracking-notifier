@@ -9,7 +9,7 @@ from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
 import datetime
 from dateutil import tz
-from psycopg2 import extras, connect, Error
+from psycopg2 import extras, connect, Error, ProgrammingError, OperationalError
 
 # Get Pacific timezone object
 tz_us_pacific = tz.gettz('US/Pacific')
@@ -109,7 +109,7 @@ def lambda_handler(event, context):
             set_clause = ", ".join([f"\"{column}\"=%s" for column in update_values.keys()])
             update_query = f"UPDATE shipments SET {set_clause} WHERE \"OrderNumber\"=%s;"
             cursor.execute(update_query, (*update_values.values(), order_number))
-        except (Error, psycopg2.ProgrammingError, psycopg2.OperationalError) as e:
+        except (Error, ProgrammingError, OperationalError) as e:
             print(f"Database error occurred while updating columns: {e}")
 
     def fetch_column_value(cursor, order_number, *columns):
@@ -123,7 +123,7 @@ def lambda_handler(event, context):
                     return result[0]
                 else:
                     return result
-        except (Error, psycopg2.ProgrammingError, psycopg2.OperationalError) as e:
+        except (Error, ProgrammingError, OperationalError) as e:
             print(f"Database error occurred while fetching column values: {e}")
         return None
 
@@ -187,12 +187,6 @@ def lambda_handler(event, context):
                     counter += 1
                     print(f"Processing order {counter} of {num_new_entries}")
 
-                    # Check if the OrderNumber already exists in the table
-                    cursor.execute("SELECT 1 FROM shipments WHERE OrderNumber = %s", (entry['OrderNumber'],))
-                    if cursor.fetchone():
-                        print(f"Order {entry['OrderNumber']} already exists. Skipping.")
-                        continue
-                    
                     sql = '''
                         INSERT INTO "shipments" ("OrderNumber", "CustomerName", "CustomerEmail", "TrackingNumber", "CarrierName", "ShippedDate", "StatusCode", "LastLocation", "DaysAtLastLocation", "NotificationSent", "Delayed", "Delivered")
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
@@ -200,8 +194,12 @@ def lambda_handler(event, context):
 
                     data = (entry['OrderNumber'], entry['CustomerName'], entry['CustomerEmail'], entry['TrackingNumber'], entry['CarrierName'], entry['ShippedDate'], entry['StatusCode'], entry['LastLocation'], entry['DaysAtLastLocation'], entry['NotificationSent'], entry['Delayed'], entry['Delivered'])
 
-                    cursor.execute(sql, data)
-                    
+                    try:
+                        cursor.execute(sql, data)
+                    except Error as e:
+                        print(f"Error inserting order #{entry['OrderNumber']} into shipments table: {e}")
+                        continue
+                        
                 cnx.commit()
 
         return
