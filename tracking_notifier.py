@@ -1,15 +1,16 @@
 import csv
-import config
 import datetime
 import json
+import traceback
+import mysql.connector
 import numpy as np
 import requests
-import mysql.connector
-from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail
-import datetime
 from dateutil import tz
 from psycopg2 import extras, connect, Error, ProgrammingError, OperationalError
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
+import config
+
 
 # Get Pacific timezone object
 tz_us_pacific = tz.gettz('US/Pacific')
@@ -41,14 +42,17 @@ def lambda_handler(event, context):
     problem_order_data = {}
     delay_order_data = {}
     stuck_order_data = {}
+    alert_order_data = {}
     count_query = "SELECT COUNT(*) FROM shipments;"
     cursor.execute(count_query)
     total_shipments = cursor.fetchone()[0]
     cursor.execute(query)
     processed_shipments = 0
+    problem_orders = 0
     errors = 0
     error_orders = []
     delivered = 0
+    alerts = 0
 
 
     def calculate_days(date1, date2):
@@ -79,6 +83,28 @@ def lambda_handler(event, context):
             response.raise_for_status()  # This will raise an exception if the request failed
         data = response.json()
         return str(data["access_token"])
+
+    def get_usps_access_token():
+        oauth_url = "https://api.usps.com/oauth2/v3/token"
+        headers = {
+            'Content-Type': 'application/json',
+        }
+        data = {
+            'client_id': config.USPS_CLIENT_ID,
+            'client_secret': config.USPS_CLIENT_SECRET,
+            'grant_type': 'client_credentials',
+            'customer_registration_id': config.USPS_CUSTOMER_REGISTRATION_ID,
+            "mailer_id": config.USPS_MAILER_ID,
+        }
+
+        response = requests.post(oauth_url, headers=headers, json=data)  # Using json=data
+
+        if response.status_code == 200:
+            response_json = response.json()
+            return response_json['access_token']
+        else:
+            print(f"Request failed with status code: {response.status_code}")
+            return None
 
     def move_row(cursor, order_number, source_table, target_table, notification_update=False):
         # Optional notification update
@@ -140,10 +166,11 @@ def lambda_handler(event, context):
         order_data_dict.setdefault(status_entry, []).append(data_to_add)
 
     def generate_order_rows(code, orders, bg_color, stuck=False):
-        if stuck:
-            code = code[5:]
-        elif code[:3] == '003':
-            code = "Status Stuck at 'Shipment Ready for UPS'"
+        if 'Pre' not in code:
+            if stuck:
+                code = code[5:]
+            elif code[:3] == '003':
+                code = "Status Stuck at 'Shipment Ready for UPS'"
 
         order_rows = f"""
             <tr style="background-color: {bg_color};">
@@ -188,58 +215,190 @@ def lambda_handler(event, context):
                     print(f"Processing order {counter} of {num_new_entries}")
 
                     sql = '''
-                        INSERT INTO "shipments" ("OrderNumber", "CustomerName", "CustomerEmail", "TrackingNumber", "CarrierName", "ShippedDate", "StatusCode", "LastLocation", "DaysAtLastLocation", "NotificationSent", "Delayed", "Delivered")
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+                        INSERT INTO "shipments" (
+                            "OrderNumber", "CustomerName", "CustomerEmail", "TrackingNumber", "CarrierName", "ShippedDate", "StatusCode", "LastLocation", 
+                            "DaysAtLastLocation", "NotificationSent", "Delayed", "Delivered",
+                            "STK", "A1GG", "A1LLF", "GreenGlow", "IronStrength", "LiquidLush", "MightyMicros", 
+                            "SoilBalance", "TurfTonic", "MosquitoDefense", "LawnGuard", "LoneStarLawnFood", 
+                            "WeedWizardBottle", "Sprayer", "LawnGuardSprayer", "WandSprayer"
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT ("OrderNumber") DO UPDATE 
+                        SET 
+                            "CustomerName" = EXCLUDED."CustomerName",
+                            "CustomerEmail" = EXCLUDED."CustomerEmail",
+                            "TrackingNumber" = EXCLUDED."TrackingNumber",
+                            "CarrierName" = EXCLUDED."CarrierName",
+                            "ShippedDate" = EXCLUDED."ShippedDate",
+                            "StatusCode" = EXCLUDED."StatusCode",
+                            "LastLocation" = EXCLUDED."LastLocation",
+                            "DaysAtLastLocation" = EXCLUDED."DaysAtLastLocation",
+                            "NotificationSent" = EXCLUDED."NotificationSent",
+                            "Delayed" = EXCLUDED."Delayed",
+                            "Delivered" = EXCLUDED."Delivered",
+                            "STK" = EXCLUDED."STK",
+                            "A1GG" = EXCLUDED."A1GG",
+                            "A1LLF" = EXCLUDED."A1LLF",
+                            "GreenGlow" = EXCLUDED."GreenGlow",
+                            "IronStrength" = EXCLUDED."IronStrength",
+                            "LiquidLush" = EXCLUDED."LiquidLush",
+                            "MightyMicros" = EXCLUDED."MightyMicros",
+                            "SoilBalance" = EXCLUDED."SoilBalance",
+                            "TurfTonic" = EXCLUDED."TurfTonic",
+                            "MosquitoDefense" = EXCLUDED."MosquitoDefense",
+                            "LawnGuard" = EXCLUDED."LawnGuard",
+                            "LoneStarLawnFood" = EXCLUDED."LoneStarLawnFood",
+                            "WeedWizardBottle" = EXCLUDED."WeedWizardBottle",
+                            "Sprayer" = EXCLUDED."Sprayer",
+                            "LawnGuardSprayer" = EXCLUDED."LawnGuardSprayer",
+                            "WandSprayer" = EXCLUDED."WandSprayer"
+                        WHERE "shipments"."TrackingNumber" != EXCLUDED."TrackingNumber";
                     '''
 
-                    data = (entry['OrderNumber'], entry['CustomerName'], entry['CustomerEmail'], entry['TrackingNumber'], entry['CarrierName'], entry['ShippedDate'], entry['StatusCode'], entry['LastLocation'], entry['DaysAtLastLocation'], entry['NotificationSent'], entry['Delayed'], entry['Delivered'])
+                    data = (
+                        entry['OrderNumber'], entry['CustomerName'], entry['CustomerEmail'], entry['TrackingNumber'], entry['CarrierName'], entry['ShippedDate'],
+                        entry['StatusCode'], entry['LastLocation'], entry['DaysAtLastLocation'], entry['NotificationSent'], entry['Delayed'], entry['Delivered'],
+                        entry.get('STK', 0), entry.get('A1GG', 0), entry.get('A1LLF', 0), entry.get('GreenGlow', 0), entry.get('IronStrength', 0), entry.get('LiquidLush', 0),
+                        entry.get('MightyMicros', 0), entry.get('SoilBalance', 0), entry.get('TurfTonic', 0), entry.get('MosquitoDefense', 0), entry.get('LawnGuard', 0),
+                        entry.get('LoneStarLawnFood', 0), entry.get('WeedWizardBottle', 0), entry.get('Sprayer', 0), entry.get('LawnGuardSprayer', 0), entry.get('WandSprayer', 0)
+                    )
 
                     try:
                         cursor.execute(sql, data)
                     except Error as e:
-                        print(f"Error inserting order #{entry['OrderNumber']} into shipments table: {e}")
+                        print(f"Error inserting or updating order #{entry['OrderNumber']} into shipments table: {e}")
+                        cnx.commit()  # Commit the successful transactions before the rollback
+                        cnx.rollback()  # Rollback the transaction
                         continue
-                        
+                            
                 cnx.commit()
 
         return
 
-    auth_token = get_ups_token()
+    current_date = datetime.datetime.now(tz_us_pacific)
 
+    usps_auth_token = get_usps_access_token()
+
+    ups_auth_token = get_ups_token()
 
     for row in cursor.fetchall():
         processed_shipments += 1
         print(f"Processing shipment {processed_shipments} out of {total_shipments}")
+        if row["ShippedDate"] == current_date.date():
+            continue
         try:
             tracking_number = row['TrackingNumber']
-            # Make a request to the UPS tracking API
+            carrier_name = row['CarrierName']
             try:
-                response = requests.get(
-                    "https://onlinetools.ups.com/api/track/v1/details/" + tracking_number,
-                    headers={
-                        "Content-Type": "application/json",
-                        "transId": config.trans_id,
-                        "transactionSrc": config.transaction_src,
-                        "Authorization": "Bearer " + auth_token,
-                    },
-                    params={
-                        "locale": "en_US",
-                        "returnSignature": "false"
+                if carrier_name == 'USPS':
+                    # Handle USPS tracking
+                    url = f'https://api.usps.com/tracking/v3/tracking/{tracking_number}?expand=DETAIL'
+                    headers = {
+                        'Authorization': 'Bearer ' + usps_auth_token
                     }
-                )
+                    response = requests.get(url, headers=headers)
+                    details = response.json()
+
+                    # current_location = details['trackingEvents'][0]['eventCity']
+
+                    # if row["LastLocation"] == current_location:
+                    #     days_at_last_location = calculate_days(row["ShippedDate"], current_date)
+
+                    #     if days_at_last_location >= 3 and :
+                    #         problem_orders += 1
+                    #         move_row(cursor, row['OrderNumber'], "shipments", "problem_orders", True)
+                    #         add_to_email(problem_order_data, "Status Stuck at 'Pre-Shipment' for 3 or More Business Days", row)
+                        
+                    #     # Update DaysAtLastLocation with the calculated days
+                    #     column_update(cursor, row['OrderNumber'], {"DaysAtLastLocation": days_since_shipped})
+
+                    if details.get('trackingEvents'):
+                        if isinstance(details['trackingEvents'], list):
+                            last_location = details['trackingEvents'][0]['eventCity']
+                        elif isinstance(details['trackingEvents'], dict):
+                            last_location = details['trackingEvents'].get('eventCity', 'Unknown')
+                        else:
+                            print(f"Unexpected type or value for trackingEvents: {type(details.get('trackingEvents'))}, {details.get('trackingEvents')}")
+                            continue
+
+                        column_update(cursor, row['OrderNumber'], {"StatusCode": details['statusCategory'], "LastLocation": last_location})
+                    else:
+                        print(f"TrackingEvents key not found in details.")
+                        continue
+
+
+                    if 'Delivered' in details['statusCategory']:
+                        delivered += 1
+                        column_update(cursor, row['OrderNumber'], {"Delivered": 'Yes'})
+                        move_row(cursor, row['OrderNumber'], "shipments", "delivered")
+                    elif details['statusCategory'] == 'Pre-Shipment' and details['statusCategory'] == row["StatusCode"]:
+                        # Calculate days since the ShippedDate
+                        days_since_shipped = calculate_days(row["ShippedDate"], current_date)
+
+                        if days_since_shipped >= 3:
+                            problem_orders += 1
+                            move_row(cursor, row['OrderNumber'], "shipments", "problem_orders", True)
+                            add_to_email(stuck_order_data, "Status Stuck at 'Pre-Shipment' for 3 or More Business Days", row)
+                        
+                        # Update DaysAtLastLocation with the calculated days
+                        column_update(cursor, row['OrderNumber'], {"DaysAtLastLocation": days_since_shipped})
+
+                    elif details['statusCategory'] == 'Alert':
+                        if details['status'] in config.problem_codes_usps:
+                            problem_orders += 1
+                            move_row(cursor, row['OrderNumber'], "shipments", "problem_orders", True)
+                            add_to_email(problem_order_data, details['status'], row)
+                        else:
+                            if row['NotificationSent'] == 'No':
+                                alerts += 1
+                                column_update(cursor, row['OrderNumber'], {"NotificationSent": 'Yes'})
+                                add_to_email(alert_order_data, details['status'], row)
+                    continue
+
+                elif carrier_name == 'UPS':
+                    response = requests.get(
+                        "https://onlinetools.ups.com/api/track/v1/details/" + tracking_number,
+                        headers={
+                            "Content-Type": "application/json",
+                            "transId": config.trans_id,
+                            "transactionSrc": config.transaction_src,
+                            "Authorization": "Bearer " + ups_auth_token,
+                        },
+                        params={
+                            "locale": "en_US",
+                            "returnSignature": "false"
+                        }
+                    )
+                else:
+                    continue
+
                 details = response.json()
+
             except json.JSONDecodeError:
                 print(f"Failed to get valid JSON response for tracking number: {tracking_number}")
+
+            if 'trackResponse' not in details:
+                print(f"'trackResponse' missing in details for {tracking_number}.")
                 continue
 
-            if ('trackResponse' not in details 
-                or 'shipment' not in details['trackResponse'] 
-                or not details['trackResponse']['shipment']  
-                or 'package' not in details['trackResponse']['shipment'][0]  
-                or not details['trackResponse']['shipment'][0]['package'] 
-                or 'activity' not in details['trackResponse']['shipment'][0]['package'][0]):
-                    print(f"Tracking details not found for {tracking_number}.")
-                    continue
+            if 'shipment' not in details['trackResponse']:
+                print(f"'shipment' missing in 'trackResponse' for {tracking_number}.")
+                continue
+
+            if not details['trackResponse']['shipment']:
+                print(f"'shipment' in 'trackResponse' is empty for {tracking_number}.")
+                continue
+
+            if 'package' not in details['trackResponse']['shipment'][0]:
+                print(f"'package' missing in 'shipment' for {tracking_number}.")
+                continue
+
+            if not details['trackResponse']['shipment'][0]['package']:
+                print(f"'package' in 'shipment' is empty for {tracking_number}.")
+                continue
+
+            if 'activity' not in details['trackResponse']['shipment'][0]['package'][0]:
+                print(f"'activity' missing in 'package' for {tracking_number}.")
+                continue
 
             package_details = details['trackResponse']['shipment'][0]['package'][0]
             activity = package_details['activity'][0]
@@ -253,9 +412,8 @@ def lambda_handler(event, context):
             # Update the StatusCode in the database
             column_update(cursor, row['OrderNumber'], {"StatusCode": new_status_entry})
 
-            current_date = datetime.datetime.now(tz_us_pacific)
             # Check for '003' status code and days since shipment
-            if status_code == '003' and calculate_days(row['ShippedDate'], current_date) > 2:
+            if status_code == '003' and calculate_days(row['ShippedDate'], current_date) >= 3:
                 is_problem_code = True
 
             # Process current location
@@ -280,11 +438,13 @@ def lambda_handler(event, context):
                                 if days_at_location >= 3 and not package_details['deliveryDate']:
                                     notification_status = fetch_column_value(cursor, row['OrderNumber'], "NotificationSent")
                                     if days_at_location >= 5 and notification_status == 'No':
+                                        problem_orders += 1
                                         add_to_email(stuck_order_data, '999: 5 Business Days without a Location Update, and No Delivery Date Found', row)
                                         move_row(cursor, row['OrderNumber'], "shipments", "problem_orders", True)
 
                                     elif days_at_location == 3:
                                         if notification_status == 'No':
+                                            problem_orders += 1
                                             add_to_email(stuck_order_data, '998: 3 Business Days without a Location Update, and No Delivery Date Found', row)
                                             column_update(cursor, row['OrderNumber'], {"NotificationSent": 'Yes'})
                                         else:
@@ -310,9 +470,11 @@ def lambda_handler(event, context):
                     delayed_status = fetch_column_value(cursor, row['OrderNumber'], "Delayed")
                     # If the order is already marked as delayed, skip this iteration
                     if delayed_status == 'No':
+                        problem_orders += 1
                         add_to_email(delay_order_data, new_status_entry, row)
                         column_update(cursor, row['OrderNumber'], {"Delayed": 'Yes'})
                 else:
+                    problem_orders += 1
                     add_to_email(problem_order_data, new_status_entry, row)
                     move_row(cursor, row['OrderNumber'], "shipments", "problem_orders", True)
 
@@ -320,17 +482,16 @@ def lambda_handler(event, context):
         except Exception as e:
             errors += 1
             error_orders.append((row['OrderNumber'], row['CustomerName'], row['TrackingNumber']))
-            print(f"Exception caught by master try-except block: {e}")
+            print(f"Exception caught by master try-except block for order {row['OrderNumber']}: {e}\n{traceback.format_exc()}")
             continue
-
-    total_problem_orders = sum(len(v) for v in problem_order_data.values()) + sum(len(v) for v in delay_order_data.values()) + sum(len(v) for v in stuck_order_data.values())
 
     report_content = f"""\
     <br><u><b>Processing Counts</b></u><br>
     # of Orders Processed: {total_shipments}<br>
     # of Orders Delivered: {delivered}<br>
-    # of Problem Orders: {total_problem_orders}<br>
-    # of Orders with Tracking Errors: {errors}<br><br>
+    # of Problem Orders: {problem_orders}<br>
+    # of Orders with Tracking Errors: {errors}<br>
+    # of Alerts: {alerts}<br><br>
     <table style="width: 100%; border: 1px solid black;">
         <tr><th colspan="6" style="font-size:18px;">Problem Orders</th></tr>
         <tr>
@@ -345,15 +506,24 @@ def lambda_handler(event, context):
 
     # Handle stuck orders first
     for code, orders in stuck_order_data.items():
-        color_key = code[:3]
+        if code[4] == ':':  # Check if the 4th character is a colon
+            color_key = code[:3]  # Extract the three numbers
+        else:
+            color_key = code  # Use the entire order code
+
         bg_color = config.email_color_codes.get(color_key, "#ffffff")
         report_content += generate_order_rows(code, orders, bg_color, True)
 
     # Handle non-delayed problem orders
     for code, orders in problem_order_data.items():
-        color_key = code[:3]
+        if code[4] == ':':  # Check if the 4th character is a colon
+            color_key = code[:3]  # Extract the three numbers
+        else:
+            color_key = code  # Use the entire order code
+
         bg_color = config.email_color_codes.get(color_key, "#ffffff")
         report_content += generate_order_rows(code, orders, bg_color)
+
 
     # Handle delayed problem orders
     for code, orders in delay_order_data.items():
@@ -363,9 +533,32 @@ def lambda_handler(event, context):
 
     report_content += "</table>"
 
+    if alerts > 0:
+        report_content += f"""
+        <br><br><table style="width: 100%; border: 1px solid black;">
+            <tr><th colspan="6" style="font-size:18px;">Alert Orders</th></tr>
+            <tr>
+                <th style="border: 1px solid black; padding: 5px;">Alert Code</th>
+                <th style="border: 1px solid black; padding: 5px;">Order Number</th>
+                <th style="border: 1px solid black; padding: 5px;">Tracking Number</th>
+                <th style="border: 1px solid black; padding: 5px;">Ship Date</th>
+                <th style="border: 1px solid black; padding: 5px;">Customer Name</th>
+                <th style="border: 1px solid black; padding: 5px;">Customer Email</th>
+            </tr>
+        """
+
+        # Handle alert orders
+        for code, orders in alert_order_data.items():
+            color_key = code
+            bg_color = config.email_color_codes.get(color_key, "#ffffff")
+            report_content += generate_order_rows(code, orders, bg_color)
+
+        report_content += "</table>"
+
+
 
     if error_orders:
-        report_content += "<br><br><u><b>Ran into errors when trying to track the following order(s):</b></u><br><ul>"
+        report_content += "<br><br><u><b>Received error message when trying to track the following order(s):</b></u><br><ul>"
         for order_number, customer, tracking in error_orders:
             report_content += f"<li>#{order_number} {customer}: {tracking}</li>"
         report_content += "</ul>"
@@ -381,6 +574,7 @@ def lambda_handler(event, context):
     print(f"Stuck shipments: {stuck_order_data}")
     print(f"Problem shipments: {problem_order_data}")
     print(f"Delay shipments: {delay_order_data}")
+    print(f"Alert shipments: {alert_order_data}")
 
     try:
         response = sg.send(report_email)
